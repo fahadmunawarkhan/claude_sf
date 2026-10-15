@@ -1,0 +1,44 @@
+name: Claude PR review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    # Skip forks (no secrets).
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Pick reviewers from changed stacks
+        id: pick
+        run: |
+          stacks="$(python3 scripts/detect-stacks.py --changed origin/${{ github.base_ref }})"
+          agents=""
+          echo "$stacks" | grep -qx salesforce && agents="apex-reviewer"
+          echo "$stacks" | grep -Eqx 'dotnet|react|wordpress' && agents="$agents code-reviewer"
+          # Always include the security pass.
+          echo "agents=${agents:-code-reviewer} security-reviewer" >> "$GITHUB_OUTPUT"
+      - name: Headless review (read-only tools)
+        env:
+          # Either credential works; the CLI uses whichever is set.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          claude -p "Review the diff between origin/${{ github.base_ref }} and HEAD. Use these subagents as appropriate: ${{ steps.pick.outputs.agents }}. Output one concise markdown review with a clear APPROVE or REQUEST CHANGES verdict." \
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)" \
+            --max-turns 15 \
+            --output-format text > review.md
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment ${{ github.event.pull_request.number }} --body-file review.md
